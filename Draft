@@ -1,0 +1,727 @@
+import random
+import tkinter as tk
+from tkinter import messagebox, simpledialog, ttk
+from collections import defaultdict
+import json
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class ScheduleManager:
+    """Manages schedule generation and bartender constraints."""
+
+    SETTINGS_FILE = "bartender_settings.json"
+    SHIFTS_FILE = "shifts_settings.json"
+    PUBLISHED_SCHEDULE_FILE = "published_schedule.json"
+
+    def __init__(self, shifts: Dict[str, bool], days: List[str]):
+        logger.info("Initializing ScheduleManager.")
+        self.shifts = self.load_shift_settings() or shifts
+        self.days = days
+        self.shift_times = self._parse_shift_times()
+        self.bartender_schedules = self.load_settings()
+        self.schedule = {}
+        self.reasons = {}
+        self.shift_count = defaultdict(int)
+        self.published_schedules = self.load_published_schedules()
+        self.week_offset = 0  # To keep track of the week being viewed
+        self.saturday_counts = defaultdict(int)  # To track Saturday counts
+        self.set_start_date()
+
+    def set_start_date(self, base_date: datetime = None):
+        """Set the start date to the Sunday of the week containing base_date."""
+        if base_date is None:
+            base_date = datetime.now() + timedelta(weeks=self.week_offset)
+        days_since_sunday = (base_date.weekday() + 1) % 7
+        self.start_date = base_date - timedelta(days=days_since_sunday)
+        logger.info(f"Start date set to {self.start_date.strftime('%Y-%m-%d')}")
+
+    def _parse_shift_times(self) -> Dict[str, Dict[str, int]]:
+        """Parse shift times from labels (e.g., '6-15') to start and end times."""
+        shift_times = {}
+        for shift in self.shifts.keys():
+            try:
+                start_hour, end_hour = map(int, shift.split('-'))
+                if end_hour < start_hour:
+                    end_hour += 24  # Overnight shift
+                shift_times[shift] = {'start': start_hour, 'end': end_hour}
+            except ValueError:
+                logger.error(f"Invalid shift format: {shift}")
+        return shift_times
+
+    def save_settings(self) -> None:
+        """Save bartender schedules to a JSON file."""
+        with open(self.SETTINGS_FILE, 'w') as file:
+            json.dump(self.bartender_schedules, file, indent=4)
+
+    def load_settings(self) -> Dict[str, Dict]:
+        """Load bartender settings from a JSON file."""
+        try:
+            with open(self.SETTINGS_FILE, 'r') as file:
+                return json.load(file)
+        except (FileNotFoundError, json.JSONDecodeError):
+            logger.warning("No existing bartender settings found.")
+            return {}
+
+    def save_shift_settings(self) -> None:
+        """Save shift settings to a JSON file."""
+        with open(self.SHIFTS_FILE, 'w') as file:
+            json.dump(self.shifts, file, indent=4)
+
+    def load_shift_settings(self) -> Optional[Dict[str, bool]]:
+        """Load shift settings from a JSON file."""
+        try:
+            with open(self.SHIFTS_FILE, 'r') as file:
+                return json.load(file)
+        except (FileNotFoundError, json.JSONDecodeError):
+            logger.warning("No existing shift settings found.")
+            return None
+
+    def save_published_schedule(self, week_start_date: datetime, schedule: Dict[str, Dict]) -> None:
+        """Save the published schedule for a specific week."""
+        week_key = week_start_date.strftime("%Y-%m-%d")
+        self.published_schedules[week_key] = schedule
+        with open(self.PUBLISHED_SCHEDULE_FILE, 'w') as file:
+            json.dump(self.published_schedules, file, indent=4)
+
+    def load_published_schedules(self) -> Dict[str, Dict]:
+        """Load all published schedules from a JSON file."""
+        try:
+            with open(self.PUBLISHED_SCHEDULE_FILE, 'r') as file:
+                return json.load(file)
+        except (FileNotFoundError, json.JSONDecodeError):
+            logger.warning("No existing published schedules found.")
+            return {}
+
+    def add_bartender(self, name: str) -> None:
+        """Add a new bartender with default settings."""
+        if name not in self.bartender_schedules:
+            self.bartender_schedules[name] = {
+                "allowed_shifts": [],
+                "restricted_days": [],
+                "restricted_shifts": [],
+                "max_shifts": 5,
+            }
+            self.save_settings()
+            logger.info(f"Bartender {name} added.")
+        else:
+            logger.warning(f"Bartender {name} already exists.")
+
+    def rename_bartender(self, old_name: str, new_name: str) -> None:
+        """Rename an existing bartender."""
+        if old_name in self.bartender_schedules and new_name not in self.bartender_schedules:
+            self.bartender_schedules[new_name] = self.bartender_schedules.pop(old_name)
+            self.save_settings()
+            logger.info(f"Bartender {old_name} renamed to {new_name}.")
+        else:
+            logger.warning(f"Rename failed: {old_name} to {new_name}.")
+
+    def remove_bartender(self, name: str) -> None:
+        """Remove a bartender."""
+        if name in self.bartender_schedules:
+            del self.bartender_schedules[name]
+            self.save_settings()
+            logger.info(f"Bartender {name} removed.")
+        else:
+            logger.warning(f"Bartender {name} not found.")
+
+    def save_bartender_logic(self, name: str, logic: Dict[str, List[str]]) -> None:
+        """Save settings for a bartender."""
+        self.bartender_schedules[name] = logic
+        self.save_settings()
+        logger.info(f"Logic for bartender {name} saved.")
+
+    def parse_constraints(self, text: str) -> Optional[Dict[str, List[str]]]:
+        """Parse bartender constraints from text."""
+        if not text.strip():
+            return {
+                "allowed_shifts": [],
+                "restricted_days": [],
+                "restricted_shifts": [],
+                "max_shifts": 5,
+            }
+        allowed_shifts, restricted_days, restricted_shifts = [], [], []
+        max_shifts = 5
+        lines = text.strip().split('\n')
+        for line in lines:
+            line = line.strip()
+            if "doesn't work" in line:
+                content = line.split("doesn't work", 1)[1].strip()
+                restricted_days.append(content.capitalize())
+            elif "cannot work" in line:
+                content = line.split("cannot work", 1)[1].strip()
+                restricted_shifts.append(content)
+            elif "can only work" in line:
+                shifts = [s.strip() for s in line.split("can only work", 1)[1].replace(' or ', ',').split(',')]
+                allowed_shifts.extend(shifts)
+            elif "up to" in line and "shifts" in line:
+                try:
+                    max_shifts = int(line.split("up to", 1)[1].split("shifts")[0].strip())
+                except ValueError:
+                    max_shifts = 5
+        return {
+            "allowed_shifts": allowed_shifts,
+            "restricted_days": restricted_days,
+            "restricted_shifts": restricted_shifts,
+            "max_shifts": max_shifts,
+        }
+
+    def generate_schedule(self) -> None:
+        """Generate a fair schedule respecting constraints."""
+        self.schedule = defaultdict(dict)
+        bartenders = list(self.bartender_schedules.keys())
+        self.shift_count = defaultdict(int)
+        last_shift_info = {b: {'day_index': -1, 'end_time': 0} for b in bartenders}
+        self.reasons = {}
+        self.set_start_date()
+        week_key = self.start_date.strftime("%Y-%m-%d")
+
+        # Use existing schedule if it's a published past week
+        if week_key in self.published_schedules:
+            self.schedule = self.published_schedules[week_key]
+            logger.info(f"Loaded published schedule for week starting {week_key}.")
+            return
+
+        for day_index in range(7):
+            date = self.start_date + timedelta(days=day_index)
+            day_name = date.strftime("%A")
+            day_formatted = date.strftime("%d/%m")
+            day = f"{day_name} ({day_formatted})"
+            available_shifts = [s for s, active in self.shifts.items() if active]
+            random.shuffle(available_shifts)
+            for shift in available_shifts:
+                eligible_bartenders = [
+                    b for b in bartenders
+                    if day_name not in self.bartender_schedules[b].get("restricted_days", [])
+                    and shift not in self.bartender_schedules[b].get("restricted_shifts", [])
+                    and (not self.bartender_schedules[b].get("allowed_shifts") or shift in self.bartender_schedules[b]["allowed_shifts"])
+                    and self.shift_count[b] < self.bartender_schedules[b].get("max_shifts", 5)
+                    and self._has_sufficient_break(last_shift_info[b], day_index, shift)
+                ]
+
+                # Additional check for Saturday assignments
+                if day_name == "Saturday":
+                    saturday_sequences = self.get_saturday_sequences(include_current=False)
+                    eligible_bartenders = [
+                        b for b in eligible_bartenders
+                        if saturday_sequences.get(b, 0) < 3  # Allow up to 3 consecutive Saturdays
+                    ] or eligible_bartenders  # If all have reached limit, use all eligible
+
+                if eligible_bartenders:
+                    bartender = random.choice(eligible_bartenders)
+                    self.shift_count[bartender] += 1
+                    last_shift_info[bartender] = {'day_index': day_index, 'end_time': self.shift_times[shift]['end']}
+                else:
+                    bartender = "Unassigned"
+                    self.reasons[f"{day} - {shift}"] = "No eligible bartender due to constraints or insufficient break time."
+                self.schedule[day][shift] = bartender
+
+    def _has_sufficient_break(self, last_info: Dict[str, int], current_day_index: int, current_shift: str) -> bool:
+        """Check for sufficient break time between shifts."""
+        if last_info['day_index'] == -1:
+            return True
+        day_diff = current_day_index - last_info['day_index']
+        current_start = self.shift_times[current_shift]['start']
+        time_since_last = (day_diff * 24) + (current_start - last_info['end_time'])
+        return time_since_last >= 8
+
+    def swap_bartenders_in_schedule(self, day1: str, shift1: str, day2: str, shift2: str) -> None:
+        """Swap bartenders between two shifts in the schedule."""
+        bartender1 = self.schedule[day1][shift1]
+        bartender2 = self.schedule[day2][shift2]
+
+        # Update shift counts before swapping
+        if bartender1 != "Unassigned":
+            self.shift_count[bartender1] -= 1
+        if bartender2 != "Unassigned":
+            self.shift_count[bartender2] -= 1
+
+        # Swap bartenders
+        self.schedule[day1][shift1], self.schedule[day2][shift2] = bartender2, bartender1
+
+        # Update shift counts after swapping
+        if bartender1 != "Unassigned":
+            self.shift_count[bartender1] += 1
+        if bartender2 != "Unassigned":
+            self.shift_count[bartender2] += 1
+
+    def assign_bartender_to_shift(self, bartender: str, day: str, shift: str) -> None:
+        """Assign a bartender to a shift."""
+        current_bartender = self.schedule[day][shift]
+
+        if current_bartender != "Unassigned":
+            # Decrease shift count of the current bartender
+            self.shift_count[current_bartender] -= 1
+
+        # Assign the new bartender
+        self.schedule[day][shift] = bartender
+        self.shift_count[bartender] += 1
+
+    def get_shift_counts(self) -> Dict[str, int]:
+        """Return the shift counts for each bartender."""
+        return dict(self.shift_count)
+
+    def get_saturday_sequences(self, include_current: bool = True) -> Dict[str, int]:
+        """Calculate the sequence of Saturdays each bartender has worked."""
+        sequences = {bartender: 0 for bartender in self.bartender_schedules.keys()}
+
+        # Filter out invalid week keys
+        valid_week_keys = []
+        for key in self.published_schedules.keys():
+            try:
+                datetime.strptime(key, '%Y-%m-%d')
+                valid_week_keys.append(key)
+            except ValueError:
+                logger.warning(f"Invalid week key '{key}' found in published schedules.")
+
+        # Sort the weeks by date in chronological order
+        weeks = sorted(
+            valid_week_keys,
+            key=lambda x: datetime.strptime(x, '%Y-%m-%d')
+        )
+
+        current_week_start_date = self.start_date
+
+        for week_key in weeks:
+            week_date = datetime.strptime(week_key, '%Y-%m-%d')
+            # Only consider weeks up to the current week being viewed
+            if week_date > current_week_start_date:
+                continue
+
+            week_schedule = self.published_schedules[week_key]
+            # Find the Saturday in the week's schedule
+            saturday_day = next((day for day in week_schedule if day.startswith("Saturday")), None)
+            if saturday_day:
+                shifts = week_schedule[saturday_day]
+                bartenders_on_saturday = set(b for b in shifts.values() if b != 'Unassigned')
+                for bartender in sequences.keys():
+                    if bartender in bartenders_on_saturday:
+                        sequences[bartender] += 1
+                    else:
+                        sequences[bartender] = 0
+            else:
+                # Reset sequences if no Saturday is scheduled
+                for bartender in sequences.keys():
+                    sequences[bartender] = 0
+
+        # Include current schedule if specified and it's not in the future
+        if include_current and current_week_start_date <= datetime.now():
+            current_saturday = next((day for day in self.schedule if day.startswith("Saturday")), None)
+            if current_saturday:
+                shifts = self.schedule[current_saturday]
+                bartenders_on_saturday = set(b for b in shifts.values() if b != 'Unassigned')
+                for bartender in sequences.keys():
+                    if bartender in bartenders_on_saturday:
+                        sequences[bartender] += 1
+                    else:
+                        sequences[bartender] = 0
+            else:
+                # Reset sequences if no Saturday is scheduled
+                for bartender in sequences.keys():
+                    sequences[bartender] = 0
+
+        return sequences
+
+    def advance_week(self) -> None:
+        """Advance the schedule to the next week."""
+        self.week_offset += 1
+        new_date = datetime.now() + timedelta(weeks=self.week_offset)
+        self.set_start_date(new_date)
+        self.generate_schedule()
+
+    def previous_week(self) -> None:
+        """Go back to the previous week."""
+        self.week_offset -= 1
+        new_date = datetime.now() + timedelta(weeks=self.week_offset)
+        self.set_start_date(new_date)
+        self.generate_schedule()
+
+
+class UIManager:
+    """Manages the user interface."""
+
+    def __init__(self, root: tk.Tk, schedule_manager: ScheduleManager):
+        logger.info("Initializing UIManager.")
+        self.root = root
+        self.schedule_manager = schedule_manager
+        self.show_settings = tk.BooleanVar(value=True)
+        self.selected_shift = None  # For manual swapping
+        self.schedule_items = {}  # To keep track of canvas items
+        self.is_past_week = False  # Flag to indicate if the current week is in the past
+        self.setup_ui()
+
+    def setup_ui(self) -> None:
+        """Set up UI components."""
+        self.root.geometry("1200x900")
+        self.root.title("Bartender Schedule Setup")
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill='both', expand=True)
+        self.schedule_frame = ttk.Frame(self.notebook, padding="10")
+        self.bartender_frame = ttk.Frame(self.notebook, padding="10")
+        self.shift_frame = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.schedule_frame, text='Schedule')
+        self.notebook.add(self.bartender_frame, text='Bartenders')
+        self.notebook.add(self.shift_frame, text='Shifts')
+        self.setup_schedule_tab()
+        self.setup_bartender_tab()
+        self.setup_shift_tab()
+
+    def setup_schedule_tab(self) -> None:
+        """Set up the Schedule tab."""
+        button_frame = ttk.Frame(self.schedule_frame)
+        button_frame.pack(pady=5)
+        ttk.Button(button_frame, text="Previous Week", command=self.previous_week).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Generate Schedule", command=self.generate_schedule).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Next Week", command=self.next_week).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Publish Schedule", command=self.publish_schedule).pack(side=tk.LEFT, padx=5)
+        self.canvas = tk.Canvas(self.schedule_frame, bg="white")
+        self.canvas.pack(fill="both", expand=True)
+
+        # Frame for shift counter and unassigned reasons
+        info_frame = ttk.Frame(self.schedule_frame)
+        info_frame.pack(fill='x', pady=5)
+
+        # Shift counter display
+        shift_counter_frame = ttk.Frame(info_frame)
+        shift_counter_frame.pack(side=tk.LEFT, padx=5, fill='both', expand=True)
+        ttk.Label(shift_counter_frame, text="Shift Counts:").pack()
+        self.shift_counter_text = tk.Text(shift_counter_frame, height=10, width=50)
+        self.shift_counter_text.pack(pady=5)
+        self.shift_counter_text.config(state=tk.DISABLED)
+
+        # Saturday counter display
+        saturday_counter_frame = ttk.Frame(info_frame)
+        saturday_counter_frame.pack(side=tk.LEFT, padx=5, fill='both', expand=True)
+        ttk.Label(saturday_counter_frame, text="Saturday Counts:").pack()
+        self.saturday_counter_text = tk.Text(saturday_counter_frame, height=10, width=50)
+        self.saturday_counter_text.pack(pady=5)
+        self.saturday_counter_text.config(state=tk.DISABLED)
+
+        # Unassigned reasons display
+        unassigned_frame = ttk.Frame(info_frame)
+        unassigned_frame.pack(side=tk.LEFT, padx=5, fill='both', expand=True)
+        ttk.Label(unassigned_frame, text="Reasons for Unassigned Shifts:").pack()
+        self.unassigned_text = tk.Text(unassigned_frame, height=10, width=50)
+        self.unassigned_text.pack(pady=5)
+        self.unassigned_text.config(state=tk.DISABLED)
+
+    def setup_bartender_tab(self) -> None:
+        """Set up the Bartenders tab."""
+        ttk.Button(self.bartender_frame, text="Add Bartender", command=self.add_bartender).pack(pady=5)
+        ttk.Button(self.bartender_frame, text="Remove Bartender", command=self.remove_bartender).pack(pady=5)
+        ttk.Button(self.bartender_frame, text="Rename Bartender", command=self.rename_bartender).pack(pady=5)
+        self.bartender_list = tk.Listbox(self.bartender_frame)
+        self.bartender_list.pack(fill="y", padx=5, pady=5)
+        self.bartender_list.bind("<<ListboxSelect>>", self.select_bartender)
+        self.update_bartender_list()
+        ttk.Label(self.bartender_frame, text="Enter constraints (e.g., 'doesn't work Monday'):", wraplength=400).pack(pady=5)
+        self.logic_text = tk.Text(self.bartender_frame, height=10)
+        self.logic_text.pack(pady=5)
+        self.logic_text.insert("1.0", "Example:\ndoesn't work Monday\ncannot work 6-15\ncan only work 7-16 or 12-21\nup to 4 shifts")
+        ttk.Button(self.bartender_frame, text="Save Logic", command=self.save_bartender_logic).pack(pady=5)
+
+    def setup_shift_tab(self) -> None:
+        """Set up the Shifts tab."""
+        ttk.Button(self.shift_frame, text="Add Shift", command=self.add_shift).pack(pady=5)
+        ttk.Button(self.shift_frame, text="Remove Shift", command=self.remove_shift).pack(pady=5)
+        self.shift_list = tk.Listbox(self.shift_frame)
+        self.shift_list.pack(fill="y", padx=5, pady=5)
+        self.shift_list.bind('<Double-Button-1>', self.edit_shift)
+        self.update_shift_list()
+
+    def generate_schedule(self) -> None:
+        """Generate and display the schedule."""
+        self.selected_shift = None  # Reset selected shift
+        self.schedule_items = {}  # Reset schedule items
+        self.schedule_manager.generate_schedule()
+        self.update_schedule_display()
+        self.update_shift_counter()
+        self.update_saturday_counter()
+
+    def next_week(self) -> None:
+        """Advance to the next week's schedule."""
+        self.selected_shift = None  # Reset selected shift
+        self.schedule_items = {}  # Reset schedule items
+        self.schedule_manager.advance_week()
+        self.update_schedule_display()
+        self.update_shift_counter()
+        self.update_saturday_counter()
+
+    def previous_week(self) -> None:
+        """Go back to the previous week's schedule."""
+        self.schedule_manager.previous_week()
+        self.update_schedule_display()
+        self.update_shift_counter()
+        self.update_saturday_counter()
+
+    def publish_schedule(self) -> None:
+        """Publish the current schedule."""
+        # Check for any bartender with 4 Saturdays in a row
+        saturday_sequences = self.schedule_manager.get_saturday_sequences()
+        bartenders_over_limit = [b for b, seq in saturday_sequences.items() if seq >= 4]
+        if bartenders_over_limit:
+            message = "\n".join([f"{b} is having 4 Saturdays in a row" for b in bartenders_over_limit])
+            messagebox.showerror("Cannot Publish Schedule", message)
+            return
+
+        week_start_date = self.schedule_manager.start_date
+        self.schedule_manager.save_published_schedule(week_start_date, self.schedule_manager.schedule)
+        messagebox.showinfo("Schedule Published", "The schedule has been published and saved.")
+        self.update_schedule_display()  # Refresh to apply any sequence highlighting
+        self.update_saturday_counter()
+
+    def update_schedule_display(self) -> None:
+        """Redraw the schedule on the canvas."""
+        self.canvas.delete("all")  # Clear the canvas to prevent overlapping
+        schedule = self.schedule_manager.schedule
+        reasons = self.schedule_manager.reasons
+        cell_width = 140
+        cell_height = 30
+        days = list(schedule.keys())
+        shifts = list(self.schedule_manager.shifts.keys())
+        saturday_sequences = self.schedule_manager.get_saturday_sequences()
+
+        # Update the is_past_week flag based on the current start date
+        self.is_past_week = self.schedule_manager.start_date < datetime.now()
+
+        # Draw headers
+        for i, day in enumerate(["Shifts"] + days):
+            x = i * cell_width + 50
+            self.canvas.create_text(x, 20, text=day, font=('Helvetica', 10, 'bold'))
+
+        # Draw schedule cells
+        for row_idx, shift in enumerate(shifts):
+            y = (row_idx + 1) * cell_height + 20
+            self.canvas.create_text(50, y, text=shift)
+            for col_idx, day in enumerate(days):
+                x = (col_idx + 1) * cell_width + 50
+                bartender = schedule[day].get(shift, "Unassigned")
+                item_id = self.canvas.create_text(x, y, text=bartender, tags="bartender")
+                self.schedule_items[item_id] = (day, shift)
+
+                if not self.is_past_week:
+                    self.canvas.tag_bind(item_id, "<Button-1>", self.on_schedule_cell_click)
+                    self.canvas.tag_bind(item_id, "<Double-Button-1>", self.on_schedule_cell_double_click)
+
+                # Highlight if necessary
+                day_name = day.split(" (")[0]
+                if day_name == "Saturday" and bartender != "Unassigned":
+                    sequence = saturday_sequences.get(bartender, 0)
+                    if sequence >= 4:
+                        self.canvas.itemconfig(item_id, fill="red")
+
+        self.display_unassigned_reasons(reasons)
+
+    def on_schedule_cell_click(self, event):
+        """Handle clicks on schedule cells for swapping."""
+        if self.is_past_week:
+            return  # Do not allow editing past schedules
+
+        item = self.canvas.find_withtag("current")[0]
+        day, shift = self.schedule_items[item]
+
+        if self.selected_shift is None:
+            # First selection
+            self.selected_shift = (day, shift)
+            self.canvas.itemconfig(item, fill="blue")  # Highlight selection
+        else:
+            # Second selection
+            day1, shift1 = self.selected_shift
+            day2, shift2 = day, shift
+            self.schedule_manager.swap_bartenders_in_schedule(day1, shift1, day2, shift2)
+            self.selected_shift = None  # Reset selection
+            self.update_schedule_display()  # Refresh display
+            self.update_shift_counter()
+            self.update_saturday_counter()
+
+    def on_schedule_cell_double_click(self, event):
+        """Handle double-clicks on schedule cells for assigning to shifts."""
+        if self.is_past_week:
+            return  # Do not allow editing past schedules
+
+        item = self.canvas.find_withtag("current")[0]
+        day, shift = self.schedule_items[item]
+        self.assign_bartender_to_shift(day, shift)
+        self.update_schedule_display()
+        self.update_shift_counter()
+        self.update_saturday_counter()
+
+    def assign_bartender_to_shift(self, day: str, shift: str) -> None:
+        """Assign a bartender to a shift."""
+        bartenders = list(self.schedule_manager.bartender_schedules.keys())
+        # Show a selection dialog
+        selected_bartender = simpledialog.askstring(
+            "Assign Bartender",
+            f"Assign a bartender to {day} - {shift}:\nAvailable bartenders: {', '.join(bartenders)}",
+            initialvalue="")
+        if selected_bartender and selected_bartender in bartenders:
+            self.schedule_manager.assign_bartender_to_shift(selected_bartender, day, shift)
+            messagebox.showinfo("Assignment Complete", f"{selected_bartender} assigned to {day} - {shift}")
+        else:
+            messagebox.showerror("Error", "Invalid bartender name.")
+
+    def display_unassigned_reasons(self, reasons: Dict[str, str]) -> None:
+        """Display reasons for unassigned shifts."""
+        self.unassigned_text.config(state=tk.NORMAL)
+        self.unassigned_text.delete("1.0", tk.END)
+        for shift, reason in reasons.items():
+            self.unassigned_text.insert(tk.END, f"{shift}: {reason}\n")
+        self.unassigned_text.config(state=tk.DISABLED)
+
+    def update_shift_counter(self) -> None:
+        """Update the shift counter display."""
+        shift_counts = self.schedule_manager.get_shift_counts()
+        self.shift_counter_text.config(state=tk.NORMAL)
+        self.shift_counter_text.delete("1.0", tk.END)
+        for bartender, count in shift_counts.items():
+            self.shift_counter_text.insert(tk.END, f"{bartender}: {count} shifts\n")
+        self.shift_counter_text.config(state=tk.DISABLED)
+
+    def update_saturday_counter(self) -> None:
+        """Update the Saturday counter display."""
+        saturday_counts = self.schedule_manager.get_saturday_sequences()
+        self.saturday_counter_text.config(state=tk.NORMAL)
+        self.saturday_counter_text.delete("1.0", tk.END)
+        for bartender, count in saturday_counts.items():
+            self.saturday_counter_text.insert(tk.END, f"{bartender}: {count} consecutive Saturdays\n")
+        self.saturday_counter_text.config(state=tk.DISABLED)
+
+    def add_bartender(self) -> None:
+        """Add a new bartender."""
+        name = simpledialog.askstring("Add Bartender", "Enter name:")
+        if name:
+            self.schedule_manager.add_bartender(name)
+            self.update_bartender_list()
+
+    def remove_bartender(self) -> None:
+        """Remove a bartender."""
+        selection = self.bartender_list.curselection()
+        if selection:
+            name = self.bartender_list.get(selection)
+            confirm = messagebox.askyesno("Delete Bartender", f"Delete '{name}'?")
+            if confirm:
+                self.schedule_manager.remove_bartender(name)
+                self.update_bartender_list()
+
+    def rename_bartender(self) -> None:
+        """Rename a bartender."""
+        selection = self.bartender_list.curselection()
+        if selection:
+            old_name = self.bartender_list.get(selection)
+            new_name = simpledialog.askstring("Rename Bartender", f"New name for '{old_name}':")
+            if new_name and new_name != old_name:
+                self.schedule_manager.rename_bartender(old_name, new_name)
+                self.update_bartender_list()
+
+    def select_bartender(self, event) -> None:
+        """Display selected bartender's logic."""
+        selection = self.bartender_list.curselection()
+        if selection:
+            name = self.bartender_list.get(selection)
+            logic = self.schedule_manager.bartender_schedules.get(name, {})
+            constraints = []
+            for day in logic.get("restricted_days", []):
+                constraints.append(f"{name} doesn't work {day}")
+            if logic.get("allowed_shifts"):
+                shifts = ' or '.join(logic["allowed_shifts"])
+                constraints.append(f"{name} can only work {shifts}")
+            for shift in logic.get("restricted_shifts", []):
+                constraints.append(f"{name} cannot work {shift}")
+            constraints.append(f"up to {logic.get('max_shifts', 5)} shifts")
+            self.logic_text.delete("1.0", tk.END)
+            self.logic_text.insert("1.0", '\n'.join(constraints))
+
+    def save_bartender_logic(self) -> None:
+        """Save logic for the selected bartender."""
+        selection = self.bartender_list.curselection()
+        if not selection:
+            messagebox.showerror("Error", "Select a bartender first.")
+            return
+        name = self.bartender_list.get(selection)
+        text = self.logic_text.get("1.0", tk.END).strip()
+        logic = self.schedule_manager.parse_constraints(text)
+        self.schedule_manager.save_bartender_logic(name, logic)
+        messagebox.showinfo("Success", "Logic saved.")
+
+    def update_bartender_list(self) -> None:
+        """Update the bartender listbox."""
+        self.bartender_list.delete(0, tk.END)
+        for name in self.schedule_manager.bartender_schedules.keys():
+            self.bartender_list.insert(tk.END, name)
+
+    def add_shift(self) -> None:
+        """Add a new shift."""
+        shift = simpledialog.askstring("Add Shift", "Enter shift (start-end):")
+        if shift and self.validate_shift(shift):
+            self.schedule_manager.shifts[shift] = True
+            self.schedule_manager.save_shift_settings()
+            self.schedule_manager.shift_times = self.schedule_manager._parse_shift_times()
+            self.update_shift_list()
+        else:
+            messagebox.showerror("Error", "Invalid shift format.")
+
+    def remove_shift(self) -> None:
+        """Remove a shift."""
+        selection = self.shift_list.curselection()
+        if selection:
+            shift = self.shift_list.get(selection).split(" - ")[0]
+            confirm = messagebox.askyesno("Delete Shift", f"Delete shift '{shift}'?")
+            if confirm:
+                del self.schedule_manager.shifts[shift]
+                self.schedule_manager.save_shift_settings()
+                self.schedule_manager.shift_times = self.schedule_manager._parse_shift_times()
+                self.update_shift_list()
+
+    def edit_shift(self, event) -> None:
+        """Edit an existing shift."""
+        selection = self.shift_list.curselection()
+        if selection:
+            old_shift = self.shift_list.get(selection).split(" - ")[0]
+            new_shift = simpledialog.askstring("Edit Shift", "Enter new shift:", initialvalue=old_shift)
+            if new_shift and self.validate_shift(new_shift):
+                del self.schedule_manager.shifts[old_shift]
+                self.schedule_manager.shifts[new_shift] = True
+                self.schedule_manager.save_shift_settings()
+                self.schedule_manager.shift_times = self.schedule_manager._parse_shift_times()
+                self.update_shift_list()
+            else:
+                messagebox.showerror("Error", "Invalid shift format.")
+
+    def update_shift_list(self) -> None:
+        """Update the shift listbox."""
+        self.shift_list.delete(0, tk.END)
+        for shift, active in self.schedule_manager.shifts.items():
+            status = "Active" if active else "Inactive"
+            self.shift_list.insert(tk.END, f"{shift} - {status}")
+
+    @staticmethod
+    def validate_shift(shift: str) -> bool:
+        """Validate shift format."""
+        try:
+            start, end = map(int, shift.split('-'))
+            return True
+        except ValueError:
+            return False
+
+    def show_message(self, message: str) -> None:
+        """Show a message to the user."""
+        messagebox.showinfo("Information", message)
+
+
+def run_schedule_interface() -> None:
+    """Run the bartender scheduling application."""
+    shifts = {'6-15': True, '7-16': True, '12-21': True, '15-23': True, '16-1': True}
+    days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+    schedule_manager = ScheduleManager(shifts, days)
+    root = tk.Tk()
+    UIManager(root, schedule_manager)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    run_schedule_interface()
